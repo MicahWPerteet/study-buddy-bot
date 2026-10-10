@@ -5,6 +5,7 @@ Telegram <-> Claude, with conversation history and a task list saved in SQLite.
 Run:  python bot.py
 """
 
+import html
 import logging
 import os
 import sqlite3
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -43,7 +44,7 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 # ---------- System prompt ----------
 def build_system_prompt(chat_id: int) -> str:
     now = datetime.now(TIMEZONE).strftime("%A, %B %d, %Y at %I:%M %p")
-    tasks = format_tasks(chat_id, show_ids=True) or "None yet."
+    tasks = tasks_for_prompt(chat_id) or "None yet."
     return f"""You are a friendly accountability assistant for a high school student, chatting over Telegram.
 
 Current date and time: {now}
@@ -54,7 +55,14 @@ Your job:
 - Help him plan and get started. Don't write his assignments for him.
 
 Task list:
-- When he mentions an assignment, propose 2-5 steps with mini-deadlines and ask if that works. Don't save anything yet.
+- When he mentions an assignment, propose 2-5 steps with mini-deadlines and ask if that works. Don't save anything yet. Put one line before the steps, one step per line as a keycap emoji, a few words, and the day, then a short question:
+  Here's a plan for the WW1 essay (due Fri):
+
+  1️⃣ Pick a thesis · Sun
+  2️⃣ Gather 3 sources · Tue
+  3️⃣ Outline · Wed
+
+  Work for you?
 - Once he agrees, save it with save_assignment, then confirm in a few words.
 - When he says he finished a step, mark it with complete_step. Use update_assignment or update_step when plans change, and delete_assignment only if he asks or the assignment got cancelled.
 - Tools take dates as YYYY-MM-DD. Work out days like "Friday" from the current date above.
@@ -65,7 +73,7 @@ Current tasks:
 
 Style:
 - Write like a text message: short, casual, usually 1-3 sentences.
-- No markdown headers or long bullet lists."""
+- Plain text only. Telegram shows markdown like ** or # as raw symbols, so never use it. A step proposal is the only list you write."""
 
 
 # ---------- Database ----------
@@ -273,29 +281,59 @@ def get_open_assignments(chat_id: int) -> list[dict]:
     return assignments
 
 
-def format_tasks(chat_id: int, show_ids: bool) -> str:
-    """Plain-text task list: with ids for Claude's system prompt, without for /tasks."""
+def is_overdue(step: dict) -> bool:
+    return not step["done_at"] and step["due_date"] < datetime.now(TIMEZONE).date().isoformat()
+
+
+def tasks_for_prompt(chat_id: int) -> str:
+    """Plain-text task list with ids and ISO dates, for Claude's system prompt."""
+
+    def show_date(iso: str) -> str:
+        return date.fromisoformat(iso).strftime("%a %Y-%m-%d")
+
+    lines = []
+    for assignment in get_open_assignments(chat_id):
+        subject = f" ({assignment['subject']})" if assignment["subject"] else ""
+        lines.append(
+            f"[assignment {assignment['id']}] {assignment['title']}{subject}, "
+            f"due {show_date(assignment['due_date'])}"
+        )
+        for step in assignment["steps"]:
+            mark = "✓" if step["done_at"] else "-"
+            overdue = ", overdue" if is_overdue(step) else ""
+            lines.append(
+                f"  {mark} [step {step['id']}] {step['description']} "
+                f"(by {show_date(step['due_date'])}{overdue})"
+            )
+    return "\n".join(lines)
+
+
+def tasks_for_telegram(chat_id: int) -> str:
+    """Task list for /tasks, formatted with Telegram HTML (send with parse_mode=HTML)."""
 
     def show_date(iso: str) -> str:
         d = date.fromisoformat(iso)
-        return d.strftime("%a %Y-%m-%d") if show_ids else f"{d:%a %b} {d.day}"
+        return f"{d:%a %b} {d.day}"
 
-    today = datetime.now(TIMEZONE).date().isoformat()
-    lines = []
+    blocks = []
     for assignment in get_open_assignments(chat_id):
-        tag = f"[assignment {assignment['id']}] " if show_ids else ""
-        subject = f" ({assignment['subject']})" if assignment["subject"] else ""
-        lines.append(
-            f"{tag}{assignment['title']}{subject}, due {show_date(assignment['due_date'])}"
-        )
+        subject = f" · {html.escape(assignment['subject'])}" if assignment["subject"] else ""
+        lines = [
+            f"📚 <b>{html.escape(assignment['title'])}</b>{subject}",
+            f"<i>due {show_date(assignment['due_date'])}</i>",
+            "",
+        ]
         for step in assignment["steps"]:
-            tag = f"[step {step['id']}] " if show_ids else ""
-            mark = "✓" if step["done_at"] else "-"
-            overdue = ", overdue" if not step["done_at"] and step["due_date"] < today else ""
-            lines.append(
-                f"  {mark} {tag}{step['description']} (by {show_date(step['due_date'])}{overdue})"
-            )
-    return "\n".join(lines)
+            description = html.escape(step["description"])
+            when = show_date(step["due_date"])
+            if step["done_at"]:
+                lines.append(f"✅ <s>{description}</s> · {when}")
+            elif is_overdue(step):
+                lines.append(f"⚠️ {description} · {when} (overdue)")
+            else:
+                lines.append(f"⬜ {description} · {when}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 # ---------- Claude tools ----------
@@ -457,8 +495,10 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    tasks = format_tasks(update.effective_chat.id, show_ids=False)
-    await update.message.reply_text(tasks or "Nothing on your list right now.")
+    tasks = tasks_for_telegram(update.effective_chat.id)
+    await update.message.reply_text(
+        tasks or "Nothing on your list right now.", parse_mode=ParseMode.HTML
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
