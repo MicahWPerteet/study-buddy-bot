@@ -13,7 +13,15 @@ This covers Phases 1-3 of the plan: messaging, Claude replies, and assignments b
    source .venv/bin/activate      # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
    ```
-4. **Configure.** Copy `.env.example` to `.env` and fill in `TELEGRAM_TOKEN` and `ANTHROPIC_API_KEY`.
+4. **Configure.** Create a file named `.env` next to `bot.py` (it's gitignored, so never commit it):
+   ```
+   TELEGRAM_TOKEN=        # from @BotFather
+   ANTHROPIC_API_KEY=     # from the Claude Console
+   ALLOWED_CHAT_ID=       # leave blank for now, step 5 fills it in
+   # Optional:
+   # CLAUDE_MODEL=claude-haiku-5-5
+   # TIMEZONE=America/Chicago
+   ```
 5. **Lock it to you.** Run `python bot.py`, open your bot in Telegram, and send `/start`. It replies with your chat ID. Paste that into `.env` as `ALLOWED_CHAT_ID`, then stop the bot (Ctrl+C) and start it again. From now on it ignores everyone but you.
 6. **Text it.**
 

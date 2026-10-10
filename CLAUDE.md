@@ -11,7 +11,7 @@ A single-user Telegram bot that relays messages to Claude and acts as an account
 ```
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in TELEGRAM_TOKEN and ANTHROPIC_API_KEY
+# create .env with TELEGRAM_TOKEN and ANTHROPIC_API_KEY (see README step 4)
 python bot.py          # runs via long polling; no server or webhook
 ```
 
