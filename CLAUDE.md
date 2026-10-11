@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-user Telegram bot that relays messages to Claude and acts as an accountability/study buddy for a high school student. Everything lives in `bot.py`. Phases 1-3 are done: messaging, Claude replies, and a task list that Claude manages through tool use. Phase 4, scheduled check-ins, is the last planned phase (see Roadmap below).
+A single-user Telegram bot that relays messages to Claude and acts as an accountability/study buddy for a high school student. Everything lives in `bot.py`. All four planned phases are done: messaging, Claude replies, a task list that Claude manages through tool use, and scheduled check-ins.
 
 ## Commands
 
@@ -26,7 +26,7 @@ Changes are checked at three levels, cheapest first:
 
 1. **Offline harness:** write a throwaway script in a scratch directory (not the repo) that does `sys.path.insert(0, <repo>)` and `import bot`, run with dummy `TELEGRAM_TOKEN=x ANTHROPIC_API_KEY=x` env vars. Because `DB_PATH` is relative, the scratch directory gets its own `bot.db`. Call the task helpers directly. To drive `handle_message`, build `update`/`context` from `types.SimpleNamespace`, with an async `reply_text` and `send_chat_action`. Replace `bot.claude.messages.create` with an async fake that returns scripted responses (objects with `stop_reason` and `content` blocks).
 2. **Live API, no phone:** run the same harness without the dummy env vars. `load_dotenv()` finds the repo's `.env`, because it searches from `bot.py`'s directory, and the real Claude client is used. Wrap `bot.claude.messages.create` to print `usage` per call. Measured cost on Haiku 5.5 is about $0.0005 per message, tool rounds included.
-3. **Telegram:** run the bot from the repo root and have the user message it, then confirm from the log. Tool calls are logged as `Tool <name> -> <result>`. A successful Claude call with no `Tool` line means nothing was saved or changed. Commands (`/tasks` etc.) don't touch the `messages` table, so the row count shows how many chat exchanges happened.
+3. **Telegram:** run the bot from the repo root and have the user message it, then confirm from the log. Tool calls are logged as `Tool <name> -> <result>`. A successful Claude call with no `Tool` line means nothing was saved or changed. Commands (`/tasks` etc.) don't touch the `messages` table, so the row count shows how many chat exchanges happened. To test a check-in without waiting for its time, call `send_checkin` from a harness with `context = SimpleNamespace(job=SimpleNamespace(data=kind), bot=telegram.Bot(TELEGRAM_TOKEN))`, run from the repo root so it uses the real `bot.db`. Sending doesn't conflict with a running poller. It messages the user's phone, so ask first.
 
 ## Architecture
 
@@ -39,29 +39,19 @@ Changes are checked at three levels, cheapest first:
 - **System prompt:** `build_system_prompt(chat_id)` is rebuilt on every API call, including each round of the tool loop, so it carries the current date/time in `TIMEZONE` and the up-to-date task list. Personality, style rules (short, text-message tone, don't write assignments for the student), and the task workflow live there.
 - **Task workflow (product decision):** when the student mentions an assignment, Claude proposes 2-5 steps as a keycap-emoji list and asks first. It calls `save_assignment` only after the student agrees. Live tests show Haiku 5.5 follows this.
 - **Formatting:** Claude's replies are sent as plain text with no `parse_mode`, so the prompt forbids markdown. Telegram would show it as raw `**`/`#`, and enabling a parse mode for model output risks Telegram rejecting malformed markup. Only `/tasks` uses Telegram HTML (`tasks_for_telegram`: bold titles, italic due dates, ⬜/✅/⚠️ per step, strikethrough when done, sent with `ParseMode.HTML`). It's built in code, so any user-supplied text in it must go through `html.escape`.
+- **Check-ins (product decisions):** `schedule_checkins` registers `send_checkin` with `app.job_queue.run_daily` for each entry in `CHECKINS`: morning at 7:00 on weekdays and 10:00 on weekends, the overdue nudge at 16:00, and the evening check at 20:00, all in `TIMEZONE`. PTB numbers `days` 0-6 as Sunday-Saturday. `checkin_facts` decides what each one covers: morning and evening cover open steps due today (morning also covers assignments due today), and the nudge covers overdue steps. If there's nothing to cover, nothing is sent. Each overdue step gets at most one nudge a day because only the once-daily nudge job mentions overdue steps, so there's no `last_nudged` column. `write_checkin` has Claude write the text: same model and system prompt, recent history plus one bracketed "[Scheduled check-in...]" user turn, and no tools. If the call fails, or returns no text, it falls back to `CHECKIN_HEADERS` plus the facts. Jobs have no `Update`, so they send to `int(ALLOWED_CHAT_ID)`, and nothing is scheduled when that's unset. Check-ins fire only while `bot.py` is running, and a run missed while the bot is down is skipped.
+- **Check-ins and history:** check-ins are assistant turns with no user turn before them, so they go in their own `checkins` table, never in `messages`, which would break alternation. `checkins_for_prompt` puts the last 24 hours of them into the system prompt, so Claude knows what it sent when the student replies. `/reset` clears them along with the history.
 - **Access control:** `is_allowed` only replies to `ALLOWED_CHAT_ID`. When that is unset, `/start` replies with the caller's chat ID as a first-time setup step, and every other handler stays silent. Any new handler must check `is_allowed` first.
-- **Storage:** `bot.db` (SQLite, gitignored) with `messages`, `assignments`, and `steps` tables, created by `init_db()` at startup with `CREATE TABLE IF NOT EXISTS`. Existing databases therefore gain new tables but **not new columns**; adding a column needs an explicit `ALTER TABLE` migration in `init_db`. Each helper opens its own short-lived connection. `messages.content` holds plain text and is passed straight to the API as message content.
+- **Storage:** `bot.db` (SQLite, gitignored) with `messages`, `assignments`, `steps`, and `checkins` tables, created by `init_db()` at startup with `CREATE TABLE IF NOT EXISTS`. Existing databases therefore gain new tables but **not new columns**; adding a column needs an explicit `ALTER TABLE` migration in `init_db`. Each helper opens its own short-lived connection. `messages.content` holds plain text and is passed straight to the API as message content.
 - **Config:** loaded from `.env` via python-dotenv: `TELEGRAM_TOKEN`, `ANTHROPIC_API_KEY` (required), `ALLOWED_CHAT_ID`, `CLAUDE_MODEL` (default `claude-haiku-5-5`), `TIMEZONE` (default `America/Chicago`) (optional). The required vars are read at import time, so if one is missing the bot crashes on startup with a `KeyError`. There is no `.env.example`; README step 4 lists the variables.
 - **Logging:** the `httpx` logger is raised to WARNING on purpose, because python-telegram-bot uses `httpx` and at INFO it logs request URLs that contain the bot token. Keep it that way. The Anthropic SDK's `httpx2` logger stays at INFO; its URLs contain no secrets.
 
 ## Roadmap
 
-### Phase 4: scheduled check-ins (next, last planned phase)
-
-The bot messages the student on its own, using python-telegram-bot's `JobQueue`. The `[job-queue]` extra is already installed, so it's available as `app.job_queue` (`run_daily`, `run_repeating`). Ideas raised so far: a morning "here's what's due today" message and a nudge when a step goes overdue.
-
-Things to know before building it:
-- **No `Update` in a job.** Jobs send with `context.bot.send_message(chat_id=int(ALLOWED_CHAT_ID), ...)`. `is_allowed` doesn't apply; skip the job when `ALLOWED_CHAT_ID` is unset.
-- **History invariant trap.** A bot-initiated message is an assistant turn with no user turn before it. Storing it in `messages` as-is breaks the alternation `load_history` relies on. Decide how to handle it: don't store check-ins (Claude won't know it nudged), store them in a separate table and mention them in the system prompt, or change `load_history` to merge consecutive turns.
-- **Queries:** "due today" is `due_date = today` and "overdue" is `due_date < today AND done_at IS NULL`, with today computed in `TIMEZONE` (`is_overdue` already does this). Schedule times should carry `tzinfo=TIMEZONE`.
-- **Avoid repeat nudges:** tracking when a step was last nudged needs a new column, which means an `ALTER TABLE` migration (see Storage).
-- **Hosting:** check-ins only fire while `bot.py` is running, so the bot needs an always-on machine (a Raspberry Pi or a cheap cloud host).
-
-Open questions for the user, to settle before planning: check-in times, weekends and quiet hours, whether Claude writes the messages or they're templated (Claude costs about $0.0005 each), and how often to re-nudge an overdue step.
-
 ### Smaller follow-ups (offered, not decided)
 
 - **Due date moves:** when an assignment's due date moves, Claude currently leaves the step deadlines alone. The prompt could have it offer to spread the steps out.
+- **Hosting:** check-ins only fire while `bot.py` is running, so the bot needs an always-on machine (a Raspberry Pi or a cheap cloud host).
 - **Out of API credits:** a billing error currently gets the generic "Couldn't reach Claude just now. Try again in a sec." reply, which is misleading because retrying won't help. Catch it to log a clear line and send a different message.
 
 ## Repo workflow

@@ -1,6 +1,7 @@
 """
-Study buddy bot - Phases 1-3
-Telegram <-> Claude, with conversation history and a task list saved in SQLite.
+Study buddy bot - Phases 1-4
+Telegram <-> Claude, with conversation history and a task list saved in SQLite,
+plus scheduled check-ins.
 
 Run:  python bot.py
 """
@@ -9,7 +10,7 @@ import html
 import logging
 import os
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from anthropic import AsyncAnthropic
@@ -38,6 +39,16 @@ HISTORY_LIMIT = 20  # how many past messages Claude sees (keep it even)
 MAX_TOKENS = 2000  # thinking counts toward this, so leave room beyond the short reply
 MAX_TOOL_ROUNDS = 5  # most tool-use round trips per incoming message
 
+# Scheduled check-ins: (kind, hour, minute, days). Days run 0-6 = Sunday-Saturday.
+WEEKDAYS = (1, 2, 3, 4, 5)
+EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
+CHECKINS = [
+    ("morning", 7, 0, WEEKDAYS),
+    ("morning", 10, 0, (0, 6)),
+    ("overdue", 16, 0, EVERY_DAY),
+    ("evening", 20, 0, EVERY_DAY),
+]
+
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 
@@ -45,6 +56,7 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 def build_system_prompt(chat_id: int) -> str:
     now = datetime.now(TIMEZONE).strftime("%A, %B %d, %Y at %I:%M %p")
     tasks = tasks_for_prompt(chat_id) or "None yet."
+    checkins = checkins_for_prompt(chat_id) or "None."
     return f"""You are a friendly accountability assistant for a high school student, chatting over Telegram.
 
 Current date and time: {now}
@@ -70,6 +82,12 @@ Task list:
 
 Current tasks:
 {tasks}
+
+Check-ins:
+- You also message him on your own: a morning rundown, a 4 PM nudge about overdue steps, and an 8 PM check on today's steps. If he replies to one, handle it like any message (mark steps done, move deadlines).
+
+Check-ins you sent in the last 24 hours:
+{checkins}
 
 Style:
 - Write like a text message: short, casual, usually 1-3 sentences.
@@ -109,6 +127,16 @@ def init_db() -> None:
                 done_at       TEXT              -- NULL until finished
             )"""
         )
+        # Kept out of `messages` so stored history still alternates user/assistant.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS checkins (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                kind    TEXT    NOT NULL,  -- 'morning', 'overdue' or 'evening'
+                content TEXT    NOT NULL,
+                sent_at TEXT    NOT NULL
+            )"""
+        )
 
 
 def save_exchange(chat_id: int, user_text: str, reply: str) -> None:
@@ -137,6 +165,28 @@ def load_history(chat_id: int) -> list[dict]:
 def clear_history(chat_id: int) -> None:
     with sqlite3.connect(DB_PATH) as db:
         db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        db.execute("DELETE FROM checkins WHERE chat_id = ?", (chat_id,))
+
+
+def save_checkin(chat_id: int, kind: str, text: str) -> None:
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            "INSERT INTO checkins (chat_id, kind, content, sent_at) VALUES (?, ?, ?, ?)",
+            (chat_id, kind, text, datetime.now(TIMEZONE).isoformat()),
+        )
+
+
+def checkins_for_prompt(chat_id: int) -> str:
+    """Check-ins sent in the last 24 hours, oldest first, for Claude's system prompt."""
+    since = (datetime.now(TIMEZONE) - timedelta(hours=24)).isoformat()
+    with sqlite3.connect(DB_PATH) as db:
+        rows = db.execute(
+            "SELECT sent_at, content FROM checkins WHERE chat_id = ? AND sent_at > ? ORDER BY id",
+            (chat_id, since),
+        ).fetchall()
+    return "\n".join(
+        f"{datetime.fromisoformat(sent_at):%a %I:%M %p}: {content}" for sent_at, content in rows
+    )
 
 
 # ---------- Tasks ----------
@@ -281,8 +331,12 @@ def get_open_assignments(chat_id: int) -> list[dict]:
     return assignments
 
 
+def today() -> str:
+    return datetime.now(TIMEZONE).date().isoformat()
+
+
 def is_overdue(step: dict) -> bool:
-    return not step["done_at"] and step["due_date"] < datetime.now(TIMEZONE).date().isoformat()
+    return not step["done_at"] and step["due_date"] < today()
 
 
 def tasks_for_prompt(chat_id: int) -> str:
@@ -466,6 +520,99 @@ def tool_result(chat_id: int, block) -> dict:
     return {"type": "tool_result", "tool_use_id": block.id, "content": content, "is_error": is_error}
 
 
+# ---------- Check-ins ----------
+CHECKIN_PROMPTS = {
+    "morning": "It's the morning check-in. Everything below is due today. Tell him what's on and get him going.",
+    "overdue": "It's the after-school nudge. These steps are past their mini-deadline. Be kind but direct, and suggest the smallest next step.",
+    "evening": "It's the evening check-in. These steps were due today and aren't marked done. Ask how they went, so you can mark them done or move them.",
+}
+# Used when Claude can't be reached.
+CHECKIN_HEADERS = {
+    "morning": "Morning! On today's list:",
+    "overdue": "Quick nudge, these are past their mini-deadline:",
+    "evening": "How'd today go? Still open from today:",
+}
+
+
+def checkin_facts(chat_id: int, kind: str) -> str | None:
+    """What a check-in is about, one item per line, or None if there's nothing to say.
+
+    Morning and evening cover open steps due today, the 4 PM nudge covers overdue ones.
+    The nudge job runs once a day, so each overdue step is nudged at most once a day.
+    """
+    now = today()
+    lines = []
+    for assignment in get_open_assignments(chat_id):
+        for step in assignment["steps"]:
+            if step["done_at"]:
+                continue
+            if kind == "overdue" and step["due_date"] < now:
+                d = date.fromisoformat(step["due_date"])
+                lines.append(f"{step['description']} ({assignment['title']}, was due {d:%a %b} {d.day})")
+            elif kind != "overdue" and step["due_date"] == now:
+                lines.append(f"{step['description']} ({assignment['title']})")
+        if kind == "morning" and assignment["due_date"] == now:
+            lines.append(f"{assignment['title']} itself is due today")
+    return "\n".join(lines) or None
+
+
+async def write_checkin(chat_id: int, kind: str, facts: str) -> str:
+    """Have Claude write the check-in, falling back to a template."""
+    # Stored history always ends on an assistant turn, so this user turn keeps it alternating.
+    messages = load_history(chat_id)
+    messages.append(
+        {
+            "role": "user",
+            "content": f"[Scheduled check-in, not a message from the student] {CHECKIN_PROMPTS[kind]} "
+            f"Write the message to send him, 1-3 sentences.\n\n{facts}",
+        }
+    )
+    try:
+        response = await claude.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=build_system_prompt(chat_id),
+            output_config={"effort": "low"},
+            messages=messages,
+        )
+        text = "".join(b.text for b in response.content if b.type == "text").strip()
+    except Exception:
+        logging.exception("Claude API call failed for the %s check-in", kind)
+        text = ""
+    if not text:
+        items = "\n".join(f"• {line}" for line in facts.splitlines())
+        text = f"{CHECKIN_HEADERS[kind]}\n{items}"
+    return text
+
+
+async def send_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback. There's no Update here, so it sends to ALLOWED_CHAT_ID."""
+    kind = context.job.data
+    chat_id = int(ALLOWED_CHAT_ID)
+    facts = checkin_facts(chat_id, kind)
+    if facts is None:
+        logging.info("Check-in %s skipped (nothing to say)", kind)
+        return
+    text = await write_checkin(chat_id, kind, facts)
+    await context.bot.send_message(chat_id=chat_id, text=text)
+    save_checkin(chat_id, kind, text)
+    logging.info("Check-in %s sent", kind)
+
+
+def schedule_checkins(app: Application) -> None:
+    if not ALLOWED_CHAT_ID:
+        logging.info("ALLOWED_CHAT_ID is unset, so no check-ins are scheduled.")
+        return
+    for kind, hour, minute, days in CHECKINS:
+        app.job_queue.run_daily(
+            send_checkin,
+            time(hour, minute, tzinfo=TIMEZONE),
+            days=days,
+            data=kind,
+            name=f"{kind} {hour:02}:{minute:02}",
+        )
+
+
 # ---------- Telegram handlers ----------
 def is_allowed(update: Update) -> bool:
     return bool(ALLOWED_CHAT_ID) and str(update.effective_chat.id) == ALLOWED_CHAT_ID
@@ -567,6 +714,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    schedule_checkins(app)
 
     logging.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
