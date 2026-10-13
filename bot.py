@@ -1,7 +1,7 @@
 """
 Study buddy bot - Phases 1-4
 Telegram <-> Claude, with conversation history and a task list saved in SQLite,
-plus scheduled check-ins.
+plus scheduled check-ins and reminders.
 
 Run:  python bot.py
 """
@@ -15,10 +15,12 @@ from zoneinfo import ZoneInfo
 
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -48,6 +50,7 @@ CHECKINS = [
     ("overdue", 16, 0, EVERY_DAY),
     ("evening", 20, 0, EVERY_DAY),
 ]
+LATE_REMINDER_MINUTES = 5  # a reminder sent later than this says when it was meant for
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -56,6 +59,7 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 def build_system_prompt(chat_id: int) -> str:
     now = datetime.now(TIMEZONE).strftime("%A, %B %d, %Y at %I:%M %p")
     tasks = tasks_for_prompt(chat_id) or "None yet."
+    reminders = reminders_for_prompt(chat_id) or "None."
     checkins = checkins_for_prompt(chat_id) or "None."
     return f"""You are a friendly accountability assistant for a high school student, chatting over Telegram.
 
@@ -83,10 +87,20 @@ Task list:
 Current tasks:
 {tasks}
 
-Check-ins:
-- You also message him on your own: a morning rundown, a 4 PM nudge about overdue steps, and an 8 PM check on today's steps. If he replies to one, handle it like any message (mark steps done, move deadlines).
+Reminders:
+- When he asks you to remind him of something, save it right away with set_reminder (no need to ask first), then confirm in a few words with the day and time. If he didn't say when, ask.
+- Times are YYYY-MM-DD HH:MM, 24-hour, his local time. Work them out from the current date and time above.
+- Use repeat for things like "every day", "every weekday" or "every Tuesday" (weekly repeats on the day of the first reminder).
+- The reminder text is sent to him word for word, so write it as a short note to him, like "Email Ms. Lee about the essay".
+- Use update_reminder to change one and delete_reminder to cancel one. He can also see and cancel them with /reminders.
 
-Check-ins you sent in the last 24 hours:
+Upcoming reminders:
+{reminders}
+
+Check-ins:
+- You also message him on your own: a morning rundown, a 4 PM nudge about overdue steps, and an 8 PM check on today's steps. If he replies to one, or to a reminder, handle it like any message (mark steps done, move deadlines).
+
+Check-ins and reminders you sent in the last 24 hours:
 {checkins}
 
 Style:
@@ -132,9 +146,20 @@ def init_db() -> None:
             """CREATE TABLE IF NOT EXISTS checkins (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
-                kind    TEXT    NOT NULL,  -- 'morning', 'overdue' or 'evening'
+                kind    TEXT    NOT NULL,  -- 'morning', 'overdue', 'evening' or 'reminder'
                 content TEXT    NOT NULL,
                 sent_at TEXT    NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS reminders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER NOT NULL,
+                text       TEXT    NOT NULL,
+                remind_at  TEXT    NOT NULL,  -- next time it goes off, local 'YYYY-MM-DD HH:MM'
+                repeat     TEXT,              -- NULL, 'daily', 'weekdays' or 'weekly'
+                sent_at    TEXT,              -- NULL until a one-time reminder goes off
+                created_at TEXT    NOT NULL
             )"""
         )
 
@@ -390,6 +415,186 @@ def tasks_for_telegram(chat_id: int) -> str:
     return "\n\n".join(blocks)
 
 
+# ---------- Reminders ----------
+# Times are local TIMEZONE text, 'YYYY-MM-DD HH:MM', so they compare correctly as strings.
+REMINDER_FORMAT = "%Y-%m-%d %H:%M"
+REPEAT_DAYS = {"daily": 1, "weekdays": 1, "weekly": 7}
+MAX_REMINDER_LENGTH = 500
+
+
+def now_minute() -> str:
+    return datetime.now(TIMEZONE).strftime(REMINDER_FORMAT)
+
+
+def check_datetime(value: str) -> str:
+    """Normalize to local 'YYYY-MM-DD HH:MM'."""
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Bad time {value!r}, use YYYY-MM-DD HH:MM") from None
+    if when.tzinfo is not None:
+        when = when.astimezone(TIMEZONE)
+    return when.strftime(REMINDER_FORMAT)
+
+
+def check_reminder(text: str | None, repeat: str | None) -> None:
+    if text is not None and not text.strip():
+        raise ValueError("Reminder text can't be empty")
+    if text is not None and len(text) > MAX_REMINDER_LENGTH:
+        raise ValueError(f"Reminder text is too long, keep it under {MAX_REMINDER_LENGTH} characters")
+    if repeat is not None and repeat not in REPEAT_DAYS:
+        raise ValueError(f"Bad repeat {repeat!r}, use one of {', '.join(REPEAT_DAYS)}")
+
+
+def skip_weekend(remind_at: str) -> str:
+    when = datetime.strptime(remind_at, REMINDER_FORMAT)
+    while when.weekday() >= 5:  # Saturday or Sunday
+        when += timedelta(days=1)
+    return when.strftime(REMINDER_FORMAT)
+
+
+def next_occurrence(remind_at: str, repeat: str) -> str:
+    """The next time a repeating reminder goes off after now, skipping any that were missed."""
+    now = now_minute()
+    when = datetime.strptime(remind_at, REMINDER_FORMAT)
+    while True:
+        when += timedelta(days=REPEAT_DAYS[repeat])
+        next_time = when.strftime(REMINDER_FORMAT)
+        if repeat == "weekdays":
+            next_time = skip_weekend(next_time)
+            when = datetime.strptime(next_time, REMINDER_FORMAT)
+        if next_time > now:
+            return next_time
+
+
+def find_reminder(db: sqlite3.Connection, chat_id: int, reminder_id: int) -> tuple:
+    """Return (text, remind_at, repeat) of a reminder that hasn't gone off yet."""
+    row = db.execute(
+        """SELECT text, remind_at, repeat FROM reminders
+           WHERE id = ? AND chat_id = ? AND sent_at IS NULL""",
+        (reminder_id, chat_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"No upcoming reminder with id {reminder_id}")
+    return row
+
+
+def add_reminder(chat_id: int, text: str, remind_at: str, repeat: str | None = None) -> tuple[int, str]:
+    """Returns the new reminder's id and the time it will go off."""
+    check_reminder(text, repeat)
+    remind_at = check_datetime(remind_at)
+    if repeat == "weekdays":
+        remind_at = skip_weekend(remind_at)
+    if remind_at < now_minute():
+        raise ValueError(f"{remind_at} has already passed, pick a later time")
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.execute(
+            """INSERT INTO reminders (chat_id, text, remind_at, repeat, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (chat_id, text.strip(), remind_at, repeat, datetime.now(TIMEZONE).isoformat()),
+        )
+    return cursor.lastrowid, remind_at
+
+
+def update_reminder(
+    chat_id: int,
+    reminder_id: int,
+    text: str | None = None,
+    remind_at: str | None = None,
+    repeat: str | None = None,
+) -> str:
+    """Pass repeat='none' to stop it repeating. Returns the time it will go off next."""
+    if text is None and remind_at is None and repeat is None:
+        raise ValueError("Nothing to change")
+    check_reminder(text, None if repeat == "none" else repeat)
+    if remind_at is not None:
+        remind_at = check_datetime(remind_at)
+        if remind_at < now_minute():
+            raise ValueError(f"{remind_at} has already passed, pick a later time")
+    with sqlite3.connect(DB_PATH) as db:
+        old_text, old_time, old_repeat = find_reminder(db, chat_id, reminder_id)
+        text = old_text if text is None else text.strip()
+        remind_at = remind_at or old_time
+        repeat = old_repeat if repeat is None else (None if repeat == "none" else repeat)
+        if repeat == "weekdays":
+            remind_at = skip_weekend(remind_at)
+        db.execute(
+            "UPDATE reminders SET text = ?, remind_at = ?, repeat = ? WHERE id = ?",
+            (text, remind_at, repeat, reminder_id),
+        )
+    return remind_at
+
+
+def delete_reminder(chat_id: int, reminder_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as db:
+        find_reminder(db, chat_id, reminder_id)
+        db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+
+
+def get_pending_reminders(chat_id: int, due_only: bool = False) -> list[dict]:
+    """Reminders that haven't gone off yet, soonest first. due_only limits it to ones due now."""
+    query = "SELECT id, text, remind_at, repeat FROM reminders WHERE chat_id = ? AND sent_at IS NULL"
+    params: list = [chat_id]
+    if due_only:
+        query += " AND remind_at <= ?"
+        params.append(now_minute())
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute(query + " ORDER BY remind_at, id", params)]
+
+
+def mark_reminder_sent(reminder: dict) -> None:
+    """One-time reminders are done; repeating ones move on to their next time."""
+    with sqlite3.connect(DB_PATH) as db:
+        if reminder["repeat"]:
+            db.execute(
+                "UPDATE reminders SET remind_at = ? WHERE id = ?",
+                (next_occurrence(reminder["remind_at"], reminder["repeat"]), reminder["id"]),
+            )
+        else:
+            db.execute(
+                "UPDATE reminders SET sent_at = ? WHERE id = ?",
+                (datetime.now(TIMEZONE).isoformat(), reminder["id"]),
+            )
+
+
+def show_reminder_time(remind_at: str) -> str:
+    """'Mon Oct 12, 5:00 PM'"""
+    d = datetime.strptime(remind_at, REMINDER_FORMAT)
+    return f"{d:%a %b} {d.day}, {d.hour % 12 or 12}:{d:%M %p}"
+
+
+def repeat_label(reminder: dict) -> str:
+    if reminder["repeat"] == "weekly":
+        return f"every {datetime.strptime(reminder['remind_at'], REMINDER_FORMAT):%A}"
+    return {"daily": "every day", "weekdays": "every weekday"}.get(reminder["repeat"], "")
+
+
+def reminders_for_prompt(chat_id: int) -> str:
+    """Plain-text reminder list with ids, for Claude's system prompt."""
+    lines = []
+    for reminder in get_pending_reminders(chat_id):
+        d = datetime.strptime(reminder["remind_at"], REMINDER_FORMAT)
+        repeat = f", repeats {repeat_label(reminder)}" if reminder["repeat"] else ""
+        lines.append(f"[reminder {reminder['id']}] {reminder['text']} · {d:%a} {reminder['remind_at']}{repeat}")
+    return "\n".join(lines)
+
+
+def reminders_for_telegram(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Reminder list for /reminders (Telegram HTML), with a cancel button for each one."""
+    blocks, buttons = [], []
+    for reminder in get_pending_reminders(chat_id):
+        when = show_reminder_time(reminder["remind_at"])
+        if reminder["repeat"]:
+            when += f" · {repeat_label(reminder)}"
+        blocks.append(f"⏰ <b>{html.escape(reminder['text'])}</b>\n<i>{when}</i>")
+        label = reminder["text"] if len(reminder["text"]) <= 30 else reminder["text"][:29] + "…"
+        buttons.append(
+            [InlineKeyboardButton(f"❌ {label}", callback_data=f"cancel_reminder:{reminder['id']}")]
+        )
+    return "\n\n".join(blocks), InlineKeyboardMarkup(buttons) if buttons else None
+
+
 # ---------- Claude tools ----------
 TOOLS = [
     {
@@ -475,6 +680,48 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "set_reminder",
+        "description": "Set a reminder. At that time he gets the text word for word. Leave out repeat for a one-time reminder.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Short note to him, e.g. 'Email Ms. Lee about the essay'"},
+                "remind_at": {"type": "string", "description": "Local time, YYYY-MM-DD HH:MM (24-hour)"},
+                "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekly"]},
+            },
+            "required": ["text", "remind_at"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "update_reminder",
+        "description": "Change an upcoming reminder: reword it, move it, or change how it repeats ('none' stops it repeating). Only pass the fields that change.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "integer"},
+                "text": {"type": "string"},
+                "remind_at": {"type": "string", "description": "Local time, YYYY-MM-DD HH:MM (24-hour)"},
+                "repeat": {"type": "string", "enum": ["none", "daily", "weekdays", "weekly"]},
+            },
+            "required": ["reminder_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "delete_reminder",
+        "description": "Cancel an upcoming reminder (for a repeating one, all future times).",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {"reminder_id": {"type": "integer"}},
+            "required": ["reminder_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -506,6 +753,19 @@ def run_tool(chat_id: int, name: str, args: dict) -> str:
     if name == "delete_assignment":
         delete_assignment(chat_id, args["assignment_id"])
         return "Assignment deleted."
+    if name == "set_reminder":
+        reminder_id, remind_at = add_reminder(
+            chat_id, args["text"], args["remind_at"], args.get("repeat")
+        )
+        return f"Reminder {reminder_id} set for {show_reminder_time(remind_at)}."
+    if name == "update_reminder":
+        remind_at = update_reminder(
+            chat_id, args["reminder_id"], args.get("text"), args.get("remind_at"), args.get("repeat")
+        )
+        return f"Reminder updated, next one is {show_reminder_time(remind_at)}."
+    if name == "delete_reminder":
+        delete_reminder(chat_id, args["reminder_id"])
+        return "Reminder cancelled."
     raise ValueError(f"Unknown tool {name}")
 
 
@@ -599,9 +859,32 @@ async def send_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.info("Check-in %s sent", kind)
 
 
+async def send_due_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback, once a minute. Like check-ins, it sends to ALLOWED_CHAT_ID.
+
+    Polling (instead of one job per reminder) means edits, cancels and restarts need no
+    job bookkeeping, and reminders missed while the bot was down go out when it starts.
+    """
+    chat_id = int(ALLOWED_CHAT_ID)
+    now = datetime.strptime(now_minute(), REMINDER_FORMAT)
+    for reminder in get_pending_reminders(chat_id, due_only=True):
+        text = f"⏰ {reminder['text']}"
+        late = now - datetime.strptime(reminder["remind_at"], REMINDER_FORMAT)
+        if late > timedelta(minutes=LATE_REMINDER_MINUTES):
+            text += f" (meant for {show_reminder_time(reminder['remind_at'])})"
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logging.exception("Couldn't send reminder %s, will retry next minute", reminder["id"])
+            continue
+        mark_reminder_sent(reminder)
+        save_checkin(chat_id, "reminder", text)
+        logging.info("Reminder %s sent", reminder["id"])
+
+
 def schedule_checkins(app: Application) -> None:
     if not ALLOWED_CHAT_ID:
-        logging.info("ALLOWED_CHAT_ID is unset, so no check-ins are scheduled.")
+        logging.info("ALLOWED_CHAT_ID is unset, so no check-ins or reminders are scheduled.")
         return
     for kind, hour, minute, days in CHECKINS:
         app.job_queue.run_daily(
@@ -611,6 +894,10 @@ def schedule_checkins(app: Application) -> None:
             data=kind,
             name=f"{kind} {hour:02}:{minute:02}",
         )
+    # Run a second past each minute, so a run never lands just before the minute it's for.
+    app.job_queue.run_repeating(
+        send_due_reminders, interval=60, first=61 - datetime.now().second, name="reminders"
+    )
 
 
 # ---------- Telegram handlers ----------
@@ -646,6 +933,35 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         tasks or "Nothing on your list right now.", parse_mode=ParseMode.HTML
     )
+
+
+async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    text, keyboard = reminders_for_telegram(update.effective_chat.id)
+    await update.message.reply_text(
+        text or "No reminders set.", parse_mode=ParseMode.HTML, reply_markup=keyboard
+    )
+
+
+async def cancel_reminder_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A ❌ button under /reminders: cancel it, then redraw the list."""
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    query = update.callback_query
+    try:
+        delete_reminder(chat_id, int(query.data.split(":")[1]))
+        await query.answer("Cancelled")
+    except ValueError:  # already cancelled, or a one-time reminder that already went off
+        await query.answer("Already gone")
+    text, keyboard = reminders_for_telegram(chat_id)
+    try:
+        await query.edit_message_text(
+            text or "No reminders set.", parse_mode=ParseMode.HTML, reply_markup=keyboard
+        )
+    except BadRequest:  # "message is not modified", e.g. after a double tap
+        pass
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -713,6 +1029,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("tasks", tasks_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
+    app.add_handler(CallbackQueryHandler(cancel_reminder_button, pattern=r"^cancel_reminder:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     schedule_checkins(app)
 

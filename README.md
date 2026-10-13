@@ -29,7 +29,10 @@ This covers all four phases of the plan: messaging, Claude replies, assignments 
 
 - `/start`: say hi (or get your chat ID during setup)
 - `/tasks`: show your open assignments and their steps
-- `/reset`: wipe the conversation history (your tasks are kept)
+- `/reminders`: show upcoming reminders, with a ❌ button to cancel each one
+- `/reset`: wipe the conversation history (your tasks and reminders are kept)
+
+To get these in Telegram's command menu, send `/setcommands` to `@BotFather` and pick your bot.
 
 ## Tasks
 
@@ -45,9 +48,13 @@ The bot also messages you on its own:
 
 A check-in with nothing to say isn't sent. Reply to one like any other message. Times use `TIMEZONE`, and you can change them in `CHECKINS` near the top of `bot.py`.
 
+## Reminders
+
+Ask for one in plain words: "remind me at 5 to email Ms. Lee" or "every weekday at 7am remind me to pack my bag". Reminders can go off once, or repeat every day, every weekday, or every week. When it's time, the bot sends your reminder word for word, like `⏰ Email Ms. Lee`. To move, reword, or cancel one, just tell the bot, or use `/reminders` to see them all and tap ❌ to cancel. A reminder that comes due while the bot is off is sent when it starts again, with a note saying when it was meant for.
+
 ## Notes
 
 - The bot uses polling, so it runs on your own computer with no server or public URL needed. It only answers while `bot.py` is running.
-- Check-ins only go out while `bot.py` is running. For them to arrive every day, run it on something that's always on: a Raspberry Pi or a cheap cloud host.
-- Conversation history and tasks live in `bot.db` (SQLite). Claude sees the last 20 messages, your open tasks, and the check-ins it sent in the last 24 hours.
+- Check-ins and reminders only go out while `bot.py` is running. For them to arrive every day, run it on something that's always on: a Raspberry Pi or a cheap cloud host.
+- Conversation history and tasks live in `bot.db` (SQLite). Claude sees the last 20 messages, your open tasks and upcoming reminders, and the check-ins and reminders it sent in the last 24 hours.
 - Edit `build_system_prompt()` in `bot.py` to change the bot's personality.
