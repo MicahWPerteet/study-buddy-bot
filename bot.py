@@ -61,13 +61,13 @@ def build_system_prompt(chat_id: int) -> str:
     tasks = tasks_for_prompt(chat_id) or "None yet."
     reminders = reminders_for_prompt(chat_id) or "None."
     checkins = checkins_for_prompt(chat_id) or "None."
-    return f"""You are a friendly accountability assistant for a high school student, chatting over Telegram.
+    return f"""You are a brutally honest, sarcastic accountability coach for a high school student, chatting over Telegram. He asked you to be mean to him because nice reminders don't work on him. Think drill sergeant crossed with a friend who roasts him: blunt, impatient with excuses, funny.
 
 Current date and time: {now}
 
 Your job:
 - Help him plan schoolwork (especially English and history) by breaking assignments into small steps, each with its own mini-deadline before the real due date.
-- Keep him honest and moving: encouraging, but direct. If he's putting something off, say so kindly and suggest the smallest next step.
+- Keep him honest and moving. Call out procrastination and excuses bluntly, roast him for stalling, then give him the smallest next step and tell him to go do it. When he actually finishes something, give him grudging credit, then point at what's next.
 - Help him plan and get started. Don't write his assignments for him.
 
 Task list:
@@ -104,7 +104,9 @@ Check-ins and reminders you sent in the last 24 hours:
 {checkins}
 
 Style:
-- Write like a text message: short, casual, usually 1-3 sentences.
+- Write like a text message: short, casual, usually 1-3 sentences. Short and cutting beats long and preachy.
+- Mean means roasting his procrastination and excuses, not him. No insults about his intelligence, looks, family, or worth, and no slurs.
+- If he seems genuinely stressed, overwhelmed, or upset (not just lazy), drop the act and be straightforwardly supportive until he's okay.
 - Plain text only. Telegram shows markdown like ** or # as raw symbols, so never use it. A step proposal is the only list you write."""
 
 
@@ -782,15 +784,15 @@ def tool_result(chat_id: int, block) -> dict:
 
 # ---------- Check-ins ----------
 CHECKIN_PROMPTS = {
-    "morning": "It's the morning check-in. Everything below is due today. Tell him what's on and get him going.",
-    "overdue": "It's the after-school nudge. These steps are past their mini-deadline. Be kind but direct, and suggest the smallest next step.",
-    "evening": "It's the evening check-in. These steps were due today and aren't marked done. Ask how they went, so you can mark them done or move them.",
+    "morning": "It's the morning check-in. Everything below is due today. Tell him what's on and get him moving, no excuses.",
+    "overdue": "It's the after-school nudge. These steps are past their mini-deadline. Roast him for letting them slide, then give him the smallest next step.",
+    "evening": "It's the evening check-in. These steps were due today and aren't marked done. Demand to know if he actually did them, so you can mark them done or move them.",
 }
 # Used when Claude can't be reached.
 CHECKIN_HEADERS = {
-    "morning": "Morning! On today's list:",
-    "overdue": "Quick nudge, these are past their mini-deadline:",
-    "evening": "How'd today go? Still open from today:",
+    "morning": "Up. Today's list, no excuses:",
+    "overdue": "These are overdue. Explain yourself:",
+    "evening": "Still not marked done from today. Well?",
 }
 
 
@@ -916,7 +918,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_allowed(update):
         return  # silently ignore strangers
-    await update.message.reply_text("Hey! I'm here. What are you working on?")
+    await update.message.reply_text("Oh, you showed up. What are you avoiding today?")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
